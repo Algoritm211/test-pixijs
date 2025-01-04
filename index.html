@@ -1,0 +1,473 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8">
+  <title>PixiJS 3×3 Slot – Zero & Mega + Centering</title>
+  <style>
+    body {
+      margin: 0; 
+      padding: 0; 
+      background: #1e1e1e; 
+      font-family: sans-serif; 
+      color: #fff;
+    }
+    #ui-panel {
+      position: absolute; 
+      top: 10px; left: 10px;
+      background: rgba(0, 0, 0, 0.6);
+      padding: 10px;
+      border-radius: 8px;
+      width: 220px;
+    }
+    #ui-panel label, #ui-panel input, #ui-panel select {
+      display: block;
+      margin-bottom: 6px;
+      font-size: 14px;
+    }
+    #ui-panel button {
+      margin-top: 8px;
+      padding: 8px;
+      width: 100%;
+      cursor: pointer;
+      font-size: 14px;
+      font-weight: bold;
+      background: #f0b90b; /* «золотистая» кнопка */
+      border: none;
+      color: #000;
+      border-radius: 4px;
+    }
+    #balanceDisplay, #outcomeDisplay {
+      font-weight: bold;
+      margin-bottom: 12px;
+    }
+    canvas {
+      display: block;
+      margin: 0 auto;
+      background: #111111;
+    }
+  </style>
+</head>
+<body>
+
+<div id="ui-panel">
+  <div style="margin-bottom:8px; font-size:16px;">3×3 Slot (Zero & Mega)</div>
+
+  <label>Balance:</label>
+  <div id="balanceDisplay">1000</div>
+
+  <label>Bet:</label>
+  <input type="number" id="betInput" value="1" min="1" style="width:80px" />
+
+  <button id="spinBtn">SPIN</button>
+
+  <div id="outcomeDisplay"></div>
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/pixi.js/7.2.2/pixi.min.js"></script>
+<script>
+///////////////////////////////////////////////
+//   1. Параметры слота + Pixi-приложение
+///////////////////////////////////////////////
+let balance = 1000;
+const REELS_COUNT = 3;
+const ROWS_COUNT  = 3;
+const SYMBOL_SIZE = 300; 
+const SPACING     = 10;  
+
+// Создадим Pixi-приложение
+const app = new PIXI.Application({
+  width: 1000,
+  height: 1000,
+  backgroundColor: 0x111111,
+  antialias: true
+});
+document.body.appendChild(app.view);
+
+// UI
+const balanceDisplay = document.getElementById('balanceDisplay');
+const betInput       = document.getElementById('betInput');
+const spinBtn        = document.getElementById('spinBtn');
+const outcomeDisplay = document.getElementById('outcomeDisplay');
+
+balanceDisplay.textContent = balance.toString();
+
+// Контейнер, где размещаем барабаны
+const slotContainer = new PIXI.Container();
+app.stage.addChild(slotContainer);
+
+// Впоследствии мы вычислим totalWidth/totalHeight и сдвинем slotContainer в центр
+
+////////////////////////////////////////////////
+//   2. Загрузка ассетов (в папке "images/")
+////////////////////////////////////////////////
+PIXI.Assets.add('king',   'images/king.png');
+PIXI.Assets.add('bar',    'images/bar.png');
+PIXI.Assets.add('valet',  'images/valet.png');
+PIXI.Assets.add('ace',    'images/ace.png');
+PIXI.Assets.add('wild',   'images/wild.png');
+PIXI.Assets.add('ten',    'images/ten.png');
+PIXI.Assets.add('queen',  'images/queen.png');
+PIXI.Assets.add('zero',   'images/zero.png'); // новый
+PIXI.Assets.add('mega',   'images/mega.png'); // очень редкий
+
+loadAllAssets().then(() => {
+  initSlot();
+});
+
+async function loadAllAssets() {
+  const keys = [
+    'king','bar','valet','ace','wild',
+    'ten','queen','zero','mega'
+  ];
+  await PIXI.Assets.load(keys);
+}
+
+// Список символов + выплаты (за 3 в ряд)
+const SYMBOLS_LIST = [
+  { id:'KING',  pay:2 },
+  { id:'BAR',   pay:1.75  },
+  { id:'VALET', pay:1.1  },
+  { id:'ACE',   pay:2.25 },
+  { id:'WILD',  pay:5 },
+  { id:'TEN',   pay:1  },
+  { id:'QUEEN', pay:1.25 },
+  { id:'ZERO',  pay:0.5  }, // ниже 10
+  { 
+    id:'MEGA',  
+    // Особая логика: за 3 MEGA => x25 от ставки
+    // Если бы было 4 MEGA => x30, 5 MEGA => x40, etc.
+    // Но в 3x3 макс 3 в линии, так что pay=25
+    pay: 25 
+  },
+];
+
+// Вероятности
+// Уменьшим вероятность у MEGA, чтобы была редкой
+const WEIGHTS = [
+  { symbol:'WILD',  prob:0.05 },
+  { symbol:'KING',  prob:0.10 },
+  { symbol:'BAR',   prob:0.10 },
+  { symbol:'VALET', prob:0.15 },
+  { symbol:'ACE',   prob:0.12 },
+  { symbol:'QUEEN', prob:0.10 },
+  { symbol:'TEN',   prob:0.10 },
+  { symbol:'ZERO',  prob:0.20 }, // часто выпадает
+  { symbol:'MEGA',  prob:0.03 }  // очень редкий
+];
+
+// 5 линий (3 горизонтали + 2 диагонали)
+const LINES = [
+  [ [0,0],[1,0],[2,0] ],
+  [ [0,1],[1,1],[2,1] ],
+  [ [0,2],[1,2],[2,2] ],
+  [ [0,0],[1,1],[2,2] ],
+  [ [0,2],[1,1],[2,0] ]
+];
+
+////////////////////////////////////////////////
+//   3. Основные структуры
+////////////////////////////////////////////////
+let reelContainers = []; 
+let reelSymbols    = [];
+let currentSymbols = [];
+let reelTickers    = [null,null,null];
+
+// Параметры для анимации барабанов
+const SPIN_DURATION = 60; // ~1 сек
+const SPIN_SPEED    = 25;
+
+// Будем вычислять размеры слота
+let totalWidth  = REELS_COUNT*(SYMBOL_SIZE+SPACING) - SPACING;
+let totalHeight = ROWS_COUNT*(SYMBOL_SIZE+SPACING) - SPACING;
+
+function initSlot() {
+  // Создаём 3 контейнера-барабана
+  for (let r=0; r<REELS_COUNT; r++){
+    const reelC = new PIXI.Container();
+    // По умолчанию x=0,y=0, дальше мы сдвинем весь slotContainer
+    reelC.x = r*(SYMBOL_SIZE+SPACING);
+    reelC.y = 0;
+    slotContainer.addChild(reelC);
+
+    reelContainers[r] = reelC;
+    reelSymbols[r]    = [];
+    currentSymbols[r] = [];
+  }
+
+  // Начальная генерация
+  for (let r=0; r<REELS_COUNT; r++){
+    for (let row=0; row<ROWS_COUNT; row++){
+      const sid = getRandomSymbolID();
+      currentSymbols[r][row] = sid;
+
+      const spr = createSymbolSprite(sid);
+      spr.y = row*(SYMBOL_SIZE+SPACING);
+      reelContainers[r].addChild(spr);
+      reelSymbols[r][row] = spr;
+    }
+  }
+
+  // >>> Центрируем slotContainer <<<
+  slotContainer.x = (app.screen.width - totalWidth)/2;
+  slotContainer.y = (app.screen.height - totalHeight)/2;
+
+  // Кнопка SPIN
+  spinBtn.addEventListener('click', onSpin);
+}
+
+function createSymbolSprite(symID){
+  const key = symID.toLowerCase();
+  const tex = PIXI.Assets.get(key);
+  if (!tex) {
+    // fallback
+    const fallback = new PIXI.Text("??", {fontSize:36, fill:0xffffff});
+    return fallback;
+  }
+  const sp = new PIXI.Sprite(tex);
+  sp.width = SYMBOL_SIZE;
+  sp.height= SYMBOL_SIZE;
+  return sp;
+}
+
+function getRandomSymbolID(){
+  const rnd = Math.random();
+  let cum=0;
+  for (let w of WEIGHTS){
+    cum += w.prob;
+    if (rnd<=cum){
+      return w.symbol;
+    }
+  }
+  return 'TEN'; // fallback
+}
+
+let isSpinning=false;
+function onSpin(){
+  if (isSpinning) return;
+  let bet = parseInt(betInput.value,10)||1;
+  if (balance<bet){
+    outcomeDisplay.textContent="Not enough balance!";
+    return;
+  }
+  balance-=bet;
+  balanceDisplay.textContent=balance.toString();
+  outcomeDisplay.textContent="";
+
+  // убираем предыдущие анимации (tickers)
+  for (let r=0; r<REELS_COUNT; r++){
+    if (reelTickers[r]){
+      app.ticker.remove(reelTickers[r]);
+      reelTickers[r] = null;
+    }
+  }
+
+  // генерируем новые символы
+  const newSyms = [];
+  for (let r=0; r<REELS_COUNT; r++){
+    newSyms[r] = [];
+    for (let row=0; row<ROWS_COUNT; row++){
+      newSyms[r][row] = getRandomSymbolID();
+    }
+  }
+
+  isSpinning=true;
+  spinWithDelays(newSyms).then(()=>{
+    const result = calcWinWithWild(newSyms, bet);
+    const totalWin = result.totalWin;
+    if (totalWin>0){
+      balance+=totalWin;
+      balanceDisplay.textContent=balance.toString();
+      outcomeDisplay.textContent="WIN: " + totalWin;
+
+      flashWinningLines(result.winningLines);
+      spawnVictoryText(`+${totalWin}`);
+    } else {
+      outcomeDisplay.textContent="No win";
+    }
+    currentSymbols = newSyms;
+    isSpinning=false;
+  });
+}
+
+// Запускаем барабаны с задержкой 200мс
+function spinWithDelays(newSyms){
+  return new Promise((resolveAll)=>{
+    let doneCount=0;
+    function onReelDone(){
+      doneCount++;
+      if (doneCount>=REELS_COUNT){
+        resolveAll();
+      }
+    }
+    for (let r=0; r<REELS_COUNT; r++){
+      setTimeout(()=>{
+        animateOneReel(r,newSyms[r]).then(onReelDone);
+      }, 200*r);
+    }
+  });
+}
+
+function animateOneReel(reelIdx,newReel){
+  return new Promise((resolve)=>{
+    const reelC = reelContainers[reelIdx];
+    const reelSyms = reelSymbols[reelIdx];
+
+    let frameCount=0;
+    let spinTicker=(delta)=>{
+      frameCount++;
+      for (let row=0; row<ROWS_COUNT; row++){
+        reelSyms[row].y += SPIN_SPEED;
+        if (reelSyms[row].y > (ROWS_COUNT*(SYMBOL_SIZE+SPACING))){
+          reelSyms[row].y -= (ROWS_COUNT*(SYMBOL_SIZE+SPACING));
+        }
+      }
+      if (frameCount>=SPIN_DURATION){
+        app.ticker.remove(spinTicker);
+        reelTickers[reelIdx]=null;
+        // подменяем
+        for (let row=0; row<ROWS_COUNT; row++){
+          reelC.removeChild(reelSyms[row]);
+          const spr = createSymbolSprite(newReel[row]);
+          spr.y = row*(SYMBOL_SIZE+SPACING);
+          reelC.addChild(spr);
+          reelSyms[row]=spr;
+        }
+        resolve();
+      }
+    };
+    reelTickers[reelIdx]=spinTicker;
+    app.ticker.add(spinTicker);
+  });
+}
+
+///////////////////////////////////////////////
+//   Подсчёт выигрыша с учётом WILD и MEGA
+///////////////////////////////////////////////
+// Логика: checkLineSymbol(s1,s2,s3) -> возвращает ID символа, 
+//         если 3 в ряд (с учётом wild), либо null
+function calcWinWithWild(symbolsMatrix, bet){
+  let totalWin=0;
+  const winningLines=[];
+
+  for (let line of LINES){
+    const s1 = symbolsMatrix[line[0][0]][line[0][1]];
+    const s2 = symbolsMatrix[line[1][0]][line[1][1]];
+    const s3 = symbolsMatrix[line[2][0]][line[2][1]];
+
+    const lineSymbol = checkLineSymbol(s1,s2,s3);
+    if (lineSymbol){
+      // особый случай: MEGA => pay=25 (в 3x3)
+      // остальные - смотрим SYMBOLS_LIST
+      if (lineSymbol==='MEGA'){
+        // x25 от ставки
+        totalWin += (25 * bet);
+      } else {
+        const found = SYMBOLS_LIST.find(x=>x.id===lineSymbol);
+        if (found){
+          totalWin += (found.pay * bet);
+        }
+      }
+      // собираем спрайты
+      const lineSprites = line.map(coord => {
+        const rIdx=coord[0], rowIdx=coord[1];
+        return reelSymbols[rIdx][rowIdx];
+      });
+      winningLines.push(lineSprites);
+    }
+  }
+  return { totalWin, winningLines };
+}
+
+// Учитываем wild
+function checkLineSymbol(s1,s2,s3){
+  const arr=[s1,s2,s3];
+  const wildCount = arr.filter(x=>x==='WILD').length;
+  if (wildCount===3){
+    return 'WILD';
+  } else if (wildCount===2){
+    // оставшийся символ
+    let nonWild = arr.find(x=>x!=='WILD');
+    if (!nonWild) nonWild='WILD';
+    return nonWild;
+  } else if (wildCount===1){
+    const nonWilds = arr.filter(x=>x!=='WILD');
+    if (nonWilds.length===2 && nonWilds[0]===nonWilds[1]){
+      return nonWilds[0];
+    } else {
+      return null;
+    }
+  } else {
+    // 0 wild
+    if (s1===s2 && s2===s3){
+      return s1;
+    } else {
+      return null;
+    }
+  }
+}
+
+///////////////////////////////////////////////
+//   Анимация мигания выигрышных символов
+///////////////////////////////////////////////
+function flashWinningLines(linesArray){
+  if (!linesArray || linesArray.length===0) return;
+  let flashFrame=0;
+  const FLASH_DURATION=60; // ~1 сек
+  const flashTicker=(delta)=>{
+    flashFrame++;
+    let alpha=1;
+    if ((flashFrame%20)<10){
+      alpha=0.4;
+    }
+    for (let lineSprites of linesArray){
+      for (let spr of lineSprites){
+        spr.alpha=alpha;
+      }
+    }
+    if (flashFrame>=FLASH_DURATION){
+      for (let lineSprites of linesArray){
+        for (let spr of lineSprites){
+          spr.alpha=1;
+        }
+      }
+      app.ticker.remove(flashTicker);
+    }
+  };
+  app.ticker.add(flashTicker);
+}
+
+///////////////////////////////////////////////
+//   Доп. анимация победы — крупный текст
+///////////////////////////////////////////////
+function spawnVictoryText(msg){
+  const style=new PIXI.TextStyle({
+    fill:'#FFDD00',
+    fontSize:48,
+    fontWeight:'bold',
+    dropShadow:true,
+    dropShadowDistance:4,
+  });
+  const txt=new PIXI.Text(`WIN: ${msg}`, style);
+  txt.anchor.set(0.5);
+  txt.x=app.renderer.width/2;
+  txt.y=app.renderer.height/2;
+  app.stage.addChild(txt);
+
+  let frame=0;
+  const DURATION=60;
+  let ticker=(delta)=>{
+    frame++;
+    // fade out 
+    if (frame>30){
+      txt.alpha=1-((frame-30)/(DURATION-30));
+    }
+    if (frame>=DURATION){
+      app.ticker.remove(ticker);
+      app.stage.removeChild(txt);
+    }
+  };
+  app.ticker.add(ticker);
+}
+</script>
+</body>
+</html>
